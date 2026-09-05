@@ -1,9 +1,16 @@
-# MikroTik CHR Installer r22
+# MikroTik CHR Installer r23
 
 用于在 Linux 救援系统中安装 MikroTik RouterOS CHR 的交互式 Bash 脚本，支持在线安装与本地镜像安装，并针对 x86 UEFI 启动环境进行兼容处理。
 
 > [!CAUTION]
 > 脚本会完整覆盖用户选择的目标磁盘并自动重启。目标磁盘中的系统、分区和全部数据都会永久丢失。请仅在新 VPS、测试机或确认可清空的服务器上使用。
+
+## r23 主要变化
+
+- 网络配置默认使用 DHCP，自动获取 IPv4、默认网关、DNS 和 NTP。
+- 用户输入 `y` 后，可改为手动指定静态 IPv4/CIDR、网关和 DNS。
+- RouterOS 时区固定为 `Asia/Singapore`，并关闭自动时区检测。
+- 在线与本地安装、Container 预置、下载续传、SHA-256 校验和 x86 UEFI 处理逻辑保持不变。
 
 ## 主要功能
 
@@ -14,8 +21,8 @@
 - 显示下载进度，支持断点续传、网络中断自动重试和缓存复用。
 - 使用 MikroTik 官方 SHA-256 校验两个下载 ZIP；校验失败会删除错误缓存并完整重下。
 - 本地模式读取 `/tmp/chr-*.img`，并可选读取 `/tmp/container-*.npk`。
-- 自动检测当前 IPv4 地址、网关、DNS、网卡及 MAC，并允许安装前修改。
-- 自动生成无注释的 `autorun.scr`，设置静态 IPv4 和管理员密码。
+- 自动检测当前网卡及 MAC；网络默认使用 DHCP，也可选择填写静态 IPv4、网关和 DNS。
+- 自动生成无注释、无空行的 `autorun.scr`，设置网络、管理员密码和 `Asia/Singapore` 时区。
 - 预置 Container Device Mode。
 - 保留 SSH、WinBox，关闭 Telnet、FTP、HTTP、API、API-SSL 和 Bandwidth Server。
 - 关闭所有接口的 MikroTik IP Neighbor Discovery。
@@ -58,13 +65,13 @@ apt-get、dnf、microdnf、yum、apk、pacman、zypper
 请先切换到 root 用户，然后执行：
 
 ```bash
-curl -fL --retry 5 --connect-timeout 20 -o /tmp/chr-installer-r22.sh https://raw.githubusercontent.com/adslcool/CHR/main/chr-installer-r22.sh && chmod 700 /tmp/chr-installer-r22.sh && bash /tmp/chr-installer-r22.sh
+curl -fL --retry 5 --connect-timeout 20 -o /tmp/chr-installer-r23.sh https://raw.githubusercontent.com/adslcool/CHR/main/chr-installer-r23.sh && chmod 700 /tmp/chr-installer-r23.sh && bash /tmp/chr-installer-r23.sh
 ```
 
 如果系统没有 curl，可以使用 wget：
 
 ```bash
-wget -O /tmp/chr-installer-r22.sh https://raw.githubusercontent.com/adslcool/CHR/main/chr-installer-r22.sh && chmod 700 /tmp/chr-installer-r22.sh && bash /tmp/chr-installer-r22.sh
+wget -O /tmp/chr-installer-r23.sh https://raw.githubusercontent.com/adslcool/CHR/main/chr-installer-r23.sh && chmod 700 /tmp/chr-installer-r23.sh && bash /tmp/chr-installer-r23.sh
 ```
 
 不建议使用 `bash <(curl ...)` 或 `curl ... | bash`。先完整下载、确认成功后再执行，可以避免网络中断时把不完整脚本交给 Bash。
@@ -134,12 +141,11 @@ ARM64 文件名必须包含 `arm`，CHR 和 Container 文件名的架构判定�
 
 1. 选择界面语言。
 2. 选择在线安装或本地安装。
-3. 确认或修改 IPv4/CIDR。
-4. 确认或修改 IPv4 网关。
-5. 确认或修改 DNS。
-6. 输入管理员密码；输入内容会显示，直接回车则生成随机密码。
-7. 选择要覆盖的整块磁盘。
-8. 输入小写或大写 `y` 确认写盘。
+3. 选择网络配置：直接回车或输入 `n` 使用 DHCP；输入 `y` 使用静态网络。
+4. 静态模式下依次确认或修改 IPv4/CIDR、IPv4 网关和 DNS；DHCP 模式跳过这些输入。
+5. 输入管理员密码；输入内容会显示，直接回车则生成随机密码。
+6. 选择要覆盖的整块磁盘。
+7. 输入小写或大写 `y` 确认写盘。
 
 未输入 `y` 时，脚本不会开始最终磁盘写入。
 
@@ -147,11 +153,12 @@ ARM64 文件名必须包含 `arm`，CHR 和 Container 文件名的架构判定�
 
 写入镜像的 `autorun.scr` 会在 RouterOS 首次启动时：
 
-- 删除现有 DHCPv4 Client。
 - 按安装时记录的 MAC 地址定位网卡，找不到时回退到 `ether1`。
-- 设置静态 IPv4/CIDR、默认路由和 DNS。
-- 网关不在本地 IPv4 子网时，自动增加网关 `/32` 主机路由。
+- 删除现有 DHCPv4 Client，避免重复或绑定到错误网卡。
+- DHCP 模式：在识别出的网卡上新建 DHCP Client，自动接收 IPv4、默认路由、DNS 和 NTP。
+- 静态模式：设置用户指定的 IPv4/CIDR、默认路由和 DNS；网关不在本地子网时自动增加网关 `/32` 主机路由。
 - 设置 admin 密码。
+- 关闭时区自动检测，并将时区固定为 `Asia/Singapore`。
 - 关闭 IP Neighbor Discovery。
 - 关闭 Telnet、FTP、HTTP、API、API-SSL 和 Bandwidth Server。
 
@@ -159,7 +166,7 @@ ARM64 文件名必须包含 `arm`，CHR 和 Container 文件名的架构判定�
 
 ## IPv6 说明
 
-r22 目前只自动继承并写入 Linux 系统的 IPv4 网络配置，不会自动写入 IPv6 地址或 IPv6 默认路由。安装完成后，请根据云服务商提供的 IPv6 地址、前缀和网关在 RouterOS 中手动配置。
+r23 只自动配置 IPv4：默认通过 DHCP 获取，或根据用户输入写入静态 IPv4。脚本不会自动写入 IPv6 地址或 IPv6 默认路由。安装完成后，请根据云服务商提供的 IPv6 地址、前缀和网关在 RouterOS 中手动配置。
 
 链路本地 IPv6 网关必须包含出口接口，例如：
 
@@ -180,7 +187,9 @@ r22 目前只自动继承并写入 Linux 系统的 IPv4 网络配置，不会自
 /system/device-mode/print
 /ip/address/print
 /ip/route/print
+/ip/dhcp-client/print detail
 /ip/service/print
+/system/clock/print
 /file/print where name="rw/autorun.scr"
 ```
 
@@ -192,7 +201,7 @@ container: yes
 
 ## 验证情况
 
-r22 的 x86 UEFI 镜像处理已使用 RouterOS `7.21.5 long-term` 官方 CHR RAW 镜像进行测试：
+r23 沿用 r22 已验证的 x86 UEFI 镜像处理逻辑。该逻辑已使用 RouterOS `7.21.5 long-term` 官方 CHR RAW 镜像进行测试：
 
 - 转换后的 128 MiB 镜像可通过 QEMU/OVMF 启动并进入 MikroTik 登录界面。
 - 将同一镜像写入 1 GiB 虚拟磁盘后，仍可通过 QEMU/OVMF 启动。
@@ -220,6 +229,19 @@ ls -lh /tmp/chr-*.img /tmp/container-*.npk 2>&1
 
 必须恰好有一个 `chr-*.img`；`container-*.npk` 可以没有，但不能超过一个。
 
+### DHCP 启动后无法联网
+
+请先确认云平台或上游网络提供 DHCP 服务，并通过控制台执行：
+
+```routeros
+/ip/dhcp-client/print detail
+/ip/address/print
+/ip/route/print
+/ip/dns/print
+```
+
+如果服务商只提供固定地址，请重新安装并在网络配置提示中输入 `y`，填写服务商分配的静态 IPv4/CIDR、网关和 DNS。
+
 ### UEFI 写入后不能启动
 
 请确认：
@@ -237,7 +259,7 @@ ls -lh /tmp/chr-*.img /tmp/container-*.npk 2>&1
 
 ## 安全提示
 
-- 执行前建议打开脚本源码进行检查：[`chr-installer-r22.sh`](https://github.com/adslcool/CHR/blob/main/chr-installer-r22.sh)。
+- 执行前建议打开脚本源码进行检查：[`chr-installer-r23.sh`](https://github.com/adslcool/CHR/blob/main/chr-installer-r23.sh)。
 - `main` 分支内容可以变化。正式生产环境建议创建固定的 Git Tag 或 Release，并使用固定版本链接部署。
 - 不要在存有重要数据的服务器上测试。
 - 不要跳过目标磁盘名称、容量和分区信息确认。
