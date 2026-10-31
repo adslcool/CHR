@@ -577,6 +577,8 @@ valid_dns_list() {
     local value=$1
     local server
     local servers=()
+    # read -a discards the final empty field, so reject it before splitting.
+    [[ "$value" != *, ]] || return 1
     IFS=, read -r -a servers <<< "$value"
     (( ${#servers[@]} > 0 )) || return 1
     for server in "${servers[@]}"; do
@@ -2362,9 +2364,12 @@ choose_admin_password() {
 write_autorun_file() {
     local autorun_path=$1
     local gateway_host_route=""
+    local default_route_options=""
 
     if [[ "$NETWORK_MODE" == "static" ]] && ! gateway_is_on_link "$ADDRESS" "$GATEWAY"; then
         gateway_host_route="/ip/route/add dst-address=\"$GATEWAY/32\" gateway=\$ifname scope=10"
+        # RouterOS v7 needs a larger target-scope to resolve this static route.
+        default_route_options=" target-scope=11"
     fi
 
     {
@@ -2382,7 +2387,7 @@ write_autorun_file() {
             printf '/ip/dns/set servers="%s"\n' "$DNS"
             printf '/ip/address/add address="%s" interface=$ifname\n' "$ADDRESS"
             [[ -z "$gateway_host_route" ]] || printf '%s\n' "$gateway_host_route"
-            printf '/ip/route/add dst-address=0.0.0.0/0 gateway="%s"\n' "$GATEWAY"
+            printf '/ip/route/add dst-address=0.0.0.0/0 gateway="%s"%s\n' "$GATEWAY" "$default_route_options"
         fi
         printf '%s\n' '/ip/neighbor/discovery-settings/set discover-interface-list=none'
         printf '%s\n' '/ip/service/set [find where name="telnet"] disabled=yes'
