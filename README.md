@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/34208082/README.md)
+[README.md](https://github.com/user-attachments/files/34209146/README.md)
 # MikroTik CHR Installer r23
 
 用于在 Linux 救援系统中安装 MikroTik RouterOS CHR 的交互式 Bash 脚本，支持在线安装与本地镜像安装，并针对 x86 UEFI 启动环境进行兼容处理。
@@ -8,6 +8,9 @@
 
 ## r23 主要变化
 
+- 可选在 CHR 首次启动时申请官方 60 天试用授权，支持 P1、P10、P-Unlimited；公开脚本不内置任何 MikroTik.com 账号密码。
+- 手动设置 RouterOS `admin` 密码时需要输入两次，两次一致才接受；直接回车仍生成随机密码。
+- 首启授权在后台等待出口 IPv4、有效默认路由和授权服务器域名解析就绪，网络等待最多 180 秒，授权最多尝试 3 次。
 - 网络配置默认使用 DHCP，自动获取 IPv4、默认网关、DNS 和 NTP。
 - 用户输入 `y` 后，可改为手动指定静态 IPv4/CIDR、网关和 DNS。
 - RouterOS 时区固定为 `Asia/Singapore`，并关闭自动时区检测。
@@ -62,6 +65,8 @@ apt-get、dnf、microdnf、yum、apk、pacman、zypper
 ```
 
 ## 一键运行
+
+使用本次交付的脚本文件可直接运行 `bash ./chr-installer-r23.sh`。下面的 GitHub 地址以仓库实际内容为准；需将新版文件更新到仓库后，一键命令才会包含本次新增功能。
 
 请先切换到 root 用户，然后执行：
 
@@ -144,9 +149,11 @@ ARM64 文件名必须包含 `arm`，CHR 和 Container 文件名的架构判定�
 2. 选择在线安装或本地安装。
 3. 选择网络配置：直接回车或输入 `n` 使用 DHCP；输入 `y` 使用静态网络。
 4. 静态模式下依次确认或修改 IPv4/CIDR、IPv4 网关和 DNS；DHCP 模式跳过这些输入。
-5. 输入管理员密码；输入内容会显示，直接回车则生成随机密码。
-6. 选择要覆盖的整块磁盘。
-7. 输入小写或大写 `y` 确认写盘。
+5. 输入管理员密码；输入内容会显示。手动设置需要再次输入确认，不一致则重新输入；第一次直接回车则生成随机密码。
+6. 选择是否申请官方 60 天 CHR 试用授权，默认不申请。
+7. 若申请：输入自己的 MikroTik.com 账号，隐藏输入两次账号密码，再选择 P1、P10 或 P-Unlimited，默认 P-Unlimited。此账号与 RouterOS 的 `admin` 账号不同。
+8. 选择要覆盖的整块磁盘。
+9. 输入小写或大写 `y` 确认写盘。
 
 未输入 `y` 时，脚本不会开始最终磁盘写入。
 
@@ -164,6 +171,57 @@ ARM64 文件名必须包含 `arm`，CHR 和 Container 文件名的架构判定�
 - 关闭 Telnet、FTP、HTTP、API、API-SSL 和 Bandwidth Server。
 
 `autorun.scr` 不包含注释和空行。
+
+## 可选的首次启动试用授权
+
+### 授权时机与重试
+
+选择启用后，安装器会另外预置 `chr-license-firstboot.rsc`。`autorun.scr` 先完成管理员密码、网络、时区和服务配置，再在后台加载授权任务。安装器显示“已安排首次启动申请”，不表示授权已经成功。
+
+任务仅对当前授权级别为 `free` 的 CHR 执行；已有试用或正式授权时跳过，不更换级别，也不重新生成 System ID。
+
+后台任务每 5 秒检测一次以下条件，主任务按运行时间限定网络等待最多 180 秒，并可终止仍在等待 DNS 的检测子任务：
+
+1. 出口以太网接口运行，且已有有效 IPv4 地址。接口识别沿用 MAC 优先、`default-name=ether1` 回退。
+2. DHCP 模式额外要求该接口的 DHCP Client 为 `bound`；静态模式不要求 DHCP。
+3. `main` 路由表存在 active 的 IPv4 默认路由，兼容静态 `/32` 配跨子网网关的配置。
+4. 可以通过当前 RouterOS DNS 解析 `licence.mikrotik.com` 的 IPv4 地址。
+
+网关 ping 和第三方公网 IP ping 均不作为必需条件，避免云网关屏蔽 ICMP 时误判。地址、路由和 DNS 就绪只用于判断申请时机；实际授权请求检验到 MikroTik 授权服务的通信。
+
+网络就绪后使用 `/system/license/renew` 申请所选级别。每次请求最多等待 45 秒，最多 3 次，失败重试间隔 15 秒。服务返回明确的账号、密码或认证拒绝错误时提前结束；无法明确分类的错误按有限次数重试。每次都读取实际 `level` 与 `limited-upgrades` 确认结果，不依赖一条“命令已提交”提示。
+
+网络超时、认证失败或最终申请失败均不撤销已经完成的网络和服务配置。此任务不创建 Scheduler，也不会在每次重启时重新提交申请。失败后可在 WinBox 的 `System > License` 中重新输入凭据手动申请。
+
+超时日志会标明 `waiting-interface`、`waiting-address`、`waiting-dhcp`、`waiting-route` 或 `waiting-dns`。看门狗主动终止超时子任务时，RouterOS 可能同时记录 `script error: interrupted`；请结合相邻的 `[CHR license]` 日志判断原因。
+
+### 凭据与清理
+
+- 公开 Bash 脚本和 README 不保存固定账号密码；安装时由使用者自行输入。
+- 为了实现无人值守首启申请，凭据临时存放在镜像 `rw/disk/chr-license-firstboot.rsc` 中，文件权限为 `0600`。RouterOS 中的文件名为 `chr-license-firstboot.rsc`。
+- 授权任务完整加载到内存后，先删除该文件，再开始网络等待。成功、失败、跳过以及受控异常结束时均再次清理文件、子任务和用于传递状态的临时全局变量。
+- 不创建含凭据的持久化 RouterOS Script 或 Scheduler；安装器完成文件预置后清空 Bash 中对应的全局变量。输出和自定义日志不打印账号密码或完整授权命令。
+- 账号密码使用 RouterOS 字符串逐字节十六进制转义，支持 `$`、引号、反斜杠、`#`、空格等字符。**转义不是加密**，首启加载前的临时文件仍应视为明文凭据。
+- 如果首次启动任务尚未加载就断电，或遇到文件删除错误，临时文件可能仍然存在；请检查下述文件列表并手动删除。文件删除也不等于磁盘安全擦除。
+
+检查命令：
+
+```routeros
+/system/license/print
+/log/print where message~"CHR license"
+/file/print where name="chr-license-firstboot.rsc"
+/system/script/job/print
+```
+
+授权成功后，`level` 应为所选级别，`limited-upgrades` 为 `no`，日志出现 `Trial activated`；任务启动后临时授权文件应消失。
+
+如需手动重试，可使用交互命令，避免把账号密码直接粘贴到命令行：
+
+```routeros
+/system/license/renew
+```
+
+这里申请的是 MikroTik 官方 60 天试用，不是购买永久授权。同一实例不能通过重复执行 `renew` 重置试用时间，也不能直接将已有低级别试用升为更高级别试用。试用到期后按 MikroTik 官方规则处理。
 
 ## IPv6 说明
 
@@ -232,6 +290,29 @@ python3 -B -m unittest discover -s tests -v
 安全边界：测试只提取白名单中的配置和输入校验函数，不加载安装脚本的顶层代码、`main`、清理 trap 或镜像/磁盘函数。网卡信息来自临时文件和模拟 `ip`；Bash 子进程使用受限 PATH，只提供上述工具。测试只写临时普通文件，不执行下载、分区、挂载、镜像安装、真实磁盘写入或重启。
 
 `tests/routeros_subset.py` 是针对当前生成内容的有限语法检查与内存模型，未知语法或命令会报错；它不是 MikroTik 官方解释器。该套件可以发现本项目生成内容的结构与行为回归，不能证明 RouterOS 所有版本都能导入，也不验证真实 DHCP 租约、NTP 同步或实际路由转发。以下虚拟机记录单独验证了特定版本的首次启动行为；上面的 QEMU/OVMF 启动记录本身不代表网络分支已通过验证。
+
+### 本次新增功能的离线回归测试
+
+交付包额外提供 `tests/test_firstboot_trial.py`，在包的根目录执行：
+
+```bash
+python3 -B -m unittest discover -s tests -p 'test_firstboot_trial.py' -v
+```
+
+测试只提取白名单函数，不加载安装器入口、顶层 trap、镜像处理、下载、挂载、真实磁盘写入或重启函数。覆盖管理员密码二次确认和随机密码、授权默认跳过和全部级别、账号密码输入校验和不回显、字符串转义往返、两层命令转义、临时文件权限和清理、符号链接拒绝、DHCP/静态网络条件及重试参数。它不向 MikroTik 发送真实授权请求。
+
+本次执行的 Bash 语法检查、ShellCheck（warning 及以上级别）和上述 15 项离线回归检查均通过。
+
+### 本次首启授权的虚拟机验证
+
+2026-10-31 使用通过官方 SHA-256 校验的 CHR `7.21.5 long-term` 镜像，在 QEMU `8.2.2`、TCG、SeaBIOS、256 MiB RAM、e1000 网卡环境中进行验证。每个场景均从干净镜像副本启动，由真实 `autorun.scr` 加载后台授权任务。
+
+- 实际验证管理员密码登录、DHCP 获取地址和有效默认路由、授权临时文件加载后删除，以及任务结束后无残留子任务和临时状态变量。
+- 原样执行真实 `/system/license/renew` 命令，对端为隔离网络中的模拟服务器，其 TCP 连接被拒绝；验证 3 次有限重试和最终失败清理。虚拟机无法连接 MikroTik 官方服务。
+- 使用模拟授权返回及模拟授权状态，验证前两次临时失败、第三次成功；认证拒绝后仅尝试一次；请求不返回时按上限终止，最多 3 次；已有试用级别时跳过。
+- 验证未获取地址和 DNS 不应答时停止等待并清理；另一次使用原样的 180 秒网络等待配置，日志时间从 `10:58:40` 到 `11:01:40`，确认等待上限实际生效。
+
+为缩短故障分支测试，模拟场景将网络等待缩短为 8、12 或 25 秒、请求等待缩短为 3 秒、重试间隔缩短为 1 秒；上述完整 180 秒检查和真实 `renew` 连接失败检查使用原始时限。模拟授权成功只验证脚本分支，不代表已从 MikroTik 取得试用授权。没有使用真实账号密码，也没有实际申请试用；正式服务的认证、注册及成功授权仍需用户部署后验证。本次新增功能的虚拟机验证不覆盖 ARM64 和 x86 UEFI 启动转换。
 
 ### RouterOS 首次启动虚拟机验证
 
@@ -308,6 +389,8 @@ ls -lh /tmp/chr-*.img /tmp/container-*.npk 2>&1
 ## 参考项目与文档
 
 - [MikroTik RouterOS CHR](https://help.mikrotik.com/docs/spaces/ROS/pages/18350234/Cloud+Hosted+Router%2C+CHR)
+- [CHR 授权与试用说明](https://manual.mikrotik.com/docs/getting-started/routeros-licensing/chr/chr-licensing/)
+- [RouterOS license renew 参数](https://manual.mikrotik.com/docs/cli-reference/system/license/renew/)
 - [MikroTik RouterOS 下载页面](https://mikrotik.com/download)
 - [alecthw/mikrotik-routeros-chr-efi](https://github.com/alecthw/mikrotik-routeros-chr-efi)
 - [tikoci/fat-chr](https://github.com/tikoci/fat-chr)
