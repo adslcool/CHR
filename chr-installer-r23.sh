@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_BUILD="2026.09.05-dual-mode-r23-dhcp-singapore-jaclaz-gpt-fat16"
+SCRIPT_BUILD="2026.10.31-r23-optional-firstboot-trial-password-confirm"
 BASH_MINIMUM_MAJOR=4
 ONLINE_CHANNEL="long-term"
 ONLINE_VERSION_ENDPOINT="https://download.mikrotik.com/routeros/NEWESTa7.long-term"
@@ -74,6 +74,10 @@ DNS=""
 ROUTEROS_TIME_ZONE="Asia/Singapore"
 ADMIN_PASSWORD=""
 PASSWORD_WAS_GENERATED=0
+LICENSE_ENABLED=0
+LICENSE_ACCOUNT=""
+LICENSE_PASSWORD=""
+LICENSE_LEVEL="p-unlimited"
 TARGET_DISK=""
 TARGET_DISK_SECTORS=0
 INTERACTIVE_FD=0
@@ -2339,7 +2343,7 @@ choose_network_config() {
 }
 
 choose_admin_password() {
-    local generated input
+    local generated input confirmation
     generated=$(od -An -N12 -tx1 /dev/urandom | tr -d '[:space:]')
 
     while true; do
@@ -2351,6 +2355,12 @@ choose_admin_password() {
             return
         fi
         if [[ "$input" =~ ^[A-Za-z0-9._@%+=,:-]{8,64}$ ]]; then
+            printf '%s' "$(i18n '请再次输入管理员密码：' 'Confirm the admin password: ')"
+            IFS= read -r -u "$INTERACTIVE_FD" confirmation
+            if [[ "$input" != "$confirmation" ]]; then
+                warn '两次管理员密码不一致，请重新输入。' 'Admin passwords do not match; enter both again.'
+                continue
+            fi
             ADMIN_PASSWORD=$input
             PASSWORD_WAS_GENERATED=0
             return
@@ -2359,6 +2369,200 @@ choose_admin_password() {
             '密码须为 8–64 位，仅允许字母、数字和 ._@%+=,:-' \
             'Password must be 8-64 characters using letters, digits, and ._@%+=,:-'
     done
+}
+
+valid_license_field() {
+    local value=$1 max_bytes=$2
+    local LC_ALL=C
+    [[ -n "$value" && ${#value} -le "$max_bytes" && ! "$value" =~ [[:cntrl:]] ]]
+}
+
+choose_license_config() {
+    local choice account password confirmation
+
+    LICENSE_ENABLED=0
+    LICENSE_ACCOUNT=""
+    LICENSE_PASSWORD=""
+    LICENSE_LEVEL="p-unlimited"
+    while true; do
+        printf '%s' "$(i18n '是否在 CHR 首次启动时申请官方 60 天试用授权？[y/N]: ' 'Request an official 60-day CHR trial on first boot? [y/N]: ')"
+        IFS= read -r -u "$INTERACTIVE_FD" choice
+        case "$choice" in
+            ""|n|N) return 0 ;;
+            y|Y) break ;;
+            *) warn '请输入 y 或 n。' 'Enter y or n.' ;;
+        esac
+    done
+    say '账号密码仅用于本机首启申请，将临时写入镜像；首启任务加载后删除凭据文件。' \
+        'Credentials are staged temporarily in the image for this first-boot request; the task deletes the credential file after loading it.'
+    while true; do
+        printf '%s' "$(i18n 'MikroTik.com 账号（不是 RouterOS admin）：' 'MikroTik.com account (not the RouterOS admin): ')"
+        IFS= read -r -u "$INTERACTIVE_FD" account
+        if valid_license_field "$account" 254 && [[ -n "${account//[[:space:]]/}" ]]; then
+            break
+        fi
+        warn '账号不能为空，最多 254 字节，不能含控制字符。' 'Account must be nonblank, at most 254 bytes, without control characters.'
+    done
+    while true; do
+        printf '%s' "$(i18n 'MikroTik.com 密码（隐藏输入）：' 'MikroTik.com password (hidden): ')"
+        IFS= read -r -s -u "$INTERACTIVE_FD" password
+        printf '\n'
+        if ! valid_license_field "$password" 256; then
+            warn '密码不能为空，最多 256 字节，不能含控制字符。' 'Password must be nonempty, at most 256 bytes, without control characters.'
+            continue
+        fi
+        printf '%s' "$(i18n '请再次输入 MikroTik.com 密码（隐藏输入）：' 'Confirm the MikroTik.com password (hidden): ')"
+        IFS= read -r -s -u "$INTERACTIVE_FD" confirmation
+        printf '\n'
+        if [[ "$password" == "$confirmation" ]]; then
+            break
+        fi
+        warn '两次授权账号密码不一致，请重新输入。' 'MikroTik.com passwords do not match; enter both again.'
+    done
+    while true; do
+        say '请选择试用授权级别：' 'Select the trial license level:'
+        printf '%s\n' '1. P1 (1 Gbps/interface)' '2. P10 (10 Gbps/interface)' '3. P-Unlimited'
+        printf '%s' "$(i18n '请选择 [3]：' 'Please choose [3]: ')"
+        IFS= read -r -u "$INTERACTIVE_FD" choice
+        case "$choice" in
+            1) LICENSE_LEVEL="p1"; break ;;
+            2) LICENSE_LEVEL="p10"; break ;;
+            ""|3) LICENSE_LEVEL="p-unlimited"; break ;;
+            *) warn '无效选项。' 'Invalid option.' ;;
+        esac
+    done
+    LICENSE_ENABLED=1
+    LICENSE_ACCOUNT=$account
+    LICENSE_PASSWORD=$password
+    printf '%s %s\n' "$(i18n '已安排首次启动申请试用（尚未授权）：' 'Trial request scheduled for first boot (not yet activated):')" "$LICENSE_LEVEL"
+}
+
+# Encode every UTF-8 byte as a RouterOS string escape. No user input is code.
+# Quoting an already quoted command gives the second layer needed by :execute.
+routeros_quote_string() {
+    printf '"'
+    printf '%s' "$1" | od -An -v -tx1 | awk '{for (i=1; i<=NF; i++) printf "\\%s", toupper($i)}'
+    printf '"'
+}
+
+write_license_network_worker() {
+    printf '%s\n' '{' ':global chrInstallerLicenseResult' ':while (true) do={' ':set chrInstallerLicenseResult "waiting-interface"' ':do {'
+    printf ':local iface [/interface/ethernet/find where mac-address="%s"]\n' "$MAC"
+    printf '%s\n' \
+        ':if ([:len $iface] = 0) do={ :set iface [/interface/ethernet/find where default-name="ether1"] }' \
+        ':if ([:len $iface] = 0) do={ :error "waiting" }' \
+        ':if ([/interface/ethernet/get $iface running] = false) do={ :error "waiting" }' \
+        ':local ifname [/interface/ethernet/get $iface name]' \
+        ':set chrInstallerLicenseResult "waiting-address"' \
+        ':if ([:len [/ip/address/find where interface=$ifname and disabled=no and invalid=no]] = 0) do={ :error "waiting" }'
+    if [[ "$NETWORK_MODE" == "dhcp" ]]; then
+        printf '%s\n' \
+            ':set chrInstallerLicenseResult "waiting-dhcp"' \
+            ':local client [/ip/dhcp-client/find where interface=$ifname and disabled=no]' \
+            ':if ([:len $client] = 0) do={ :error "waiting" }' \
+            ':if ([/ip/dhcp-client/get $client status] != "bound") do={ :error "waiting" }'
+    fi
+    printf '%s\n' \
+        ':set chrInstallerLicenseResult "waiting-route"' \
+        ':if ([:len [/ip/route/find where dst-address=0.0.0.0/0 and routing-table="main" and active=yes]] = 0) do={ :error "waiting" }' \
+        ':set chrInstallerLicenseResult "waiting-dns"' \
+        ':local resolved [:resolve "licence.mikrotik.com" type=ipv4]' \
+        ':if ([:len [:tostr $resolved]] = 0) do={ :error "waiting" }' \
+        ':set chrInstallerLicenseResult "ready"' \
+        '} on-error={}' \
+        ':if ($chrInstallerLicenseResult = "ready") do={ :return true }' \
+        ':delay 5s' '}' '}'
+}
+
+write_license_renew_worker() {
+    local account_literal password_literal
+    account_literal=$(routeros_quote_string "$LICENSE_ACCOUNT")
+    password_literal=$(routeros_quote_string "$LICENSE_PASSWORD")
+    printf '%s\n' '{' ':global chrInstallerLicenseResult' ':local response ""'
+    printf ':onerror e in={ :set response [:tostr [/system/license/renew account=%s password=%s level=%s]] } do={ :set response [:tostr $e] }\n' \
+        "$account_literal" "$password_literal" "$LICENSE_LEVEL"
+    printf '%s\n' ':local licensed false'
+    printf ':if ([/system/license/get level] = "%s") do={ :if ([/system/license/get limited-upgrades] = false) do={ :set licensed true } }\n' "$LICENSE_LEVEL"
+    printf '%s\n' ':if ($licensed = true) do={'
+    printf '%s\n' \
+        ':set chrInstallerLicenseResult "success"' \
+        '} else={' \
+        ':if (($response ~ "([Ii]nvalid|[Ii]ncorrect|[Ww]rong|[Bb]ad).*(password|account|username|credentials)") || ($response ~ "[Aa]uthentication failed|[Nn]ot authori[sz]ed|[Nn]o such (account|user)|[Aa]ccount.*(locked|disabled)")) do={' \
+        ':set chrInstallerLicenseResult "auth-error"' \
+        '} else={ :set chrInstallerLicenseResult "retry" }' '}' '}'
+}
+
+write_license_script() {
+    local license_path=$1 network_worker renew_worker
+
+    [[ "$LICENSE_ENABLED" == "1" ]] || return 0
+    case "$LICENSE_LEVEL" in p1|p10|p-unlimited) ;; *) die '授权级别无效。' 'Invalid license level.' ;; esac
+    valid_license_field "$LICENSE_ACCOUNT" 254 && valid_license_field "$LICENSE_PASSWORD" 256 || die \
+        '授权账号或密码无效。' 'Invalid license account or password.'
+    network_worker=$(write_license_network_worker)
+    renew_worker=$(write_license_renew_worker)
+    {
+        printf '%s\n' '{' ':global chrInstallerLicenseResult' ':local requestJob ""' \
+            ':local stopJob do={ :if ([:len [:tostr $id]] > 0) do={ :do { /system/script/job/remove $id } on-error={} } }' \
+            ':local cleanup do={ /file/remove [/file/find where name="chr-license-firstboot.rsc"]; :if ([:len [/file/find where name="chr-license-firstboot.rsc"]] > 0) do={ :error "Credential file cleanup failed" } }' \
+            ':do {' '$cleanup' \
+            ':if ([/system/license/get level] != "free") do={' \
+            ':log info "[CHR license] Skipped: an existing trial or license is present"' '} else={' \
+            ':log info "[CHR license] Waiting for IPv4, active default route and license-server DNS"' \
+            ':set chrInstallerLicenseResult "waiting-interface"'
+        printf ':local networkSource %s\n' "$(routeros_quote_string "$network_worker")"
+        printf '%s\n' \
+            ':set requestJob [:execute $networkSource]' \
+            ':local deadline ([/system/resource/get uptime] + 180s)' \
+            ':while (($chrInstallerLicenseResult != "ready") && ([/system/resource/get uptime] < $deadline)) do={ :delay 1s }' \
+            '$stopJob id=$requestJob' ':set requestJob ""' \
+            ':if ($chrInstallerLicenseResult != "ready") do={' \
+            ':log warning ("[CHR license] Network wait timed out: " . $chrInstallerLicenseResult)' '} else={'
+        printf ':local renewSource %s\n' "$(routeros_quote_string "$renew_worker")"
+        printf '%s\n' ':local finished false' \
+            ':for attempt from=1 to=3 do={' \
+            ':if ($finished = false) do={' \
+            ':set chrInstallerLicenseResult "pending"' \
+            ':set requestJob [:execute $renewSource]' \
+            ':set deadline ([/system/resource/get uptime] + 45s)' \
+            ':while (($chrInstallerLicenseResult = "pending") && ([/system/resource/get uptime] < $deadline)) do={ :delay 1s }' \
+            '$stopJob id=$requestJob' ':set requestJob ""'
+        printf '%s\n' ':local licensed false'
+        printf ':if ([/system/license/get level] = "%s") do={ :if ([/system/license/get limited-upgrades] = false) do={ :set licensed true } }\n' "$LICENSE_LEVEL"
+        printf '%s\n' ':if ($licensed = true) do={'
+        printf ':log info "[CHR license] Trial activated: %s"\n' "$LICENSE_LEVEL"
+        printf '%s\n' ':set finished true' '} else={' \
+            ':if ($chrInstallerLicenseResult = "auth-error") do={' \
+            ':log warning "[CHR license] Account authentication rejected; no further attempts"' \
+            ':set finished true' '} else={' \
+            ':log warning ("[CHR license] Request unsuccessful; attempt " . $attempt . "/3")' \
+            ':if ($attempt < 3) do={ :delay 15s }' '}' '}' '}' '}' \
+            ':if ($finished = false) do={ :log warning "[CHR license] Trial request failed; use System > License to retry manually" }' \
+            '}' '}' \
+            '} on-error={ :log warning "[CHR license] Task stopped by an internal error; retry manually" }' \
+            '$stopJob id=$requestJob' ':set chrInstallerLicenseResult' \
+            ':do { $cleanup } on-error={ :log warning "[CHR license] Remove chr-license-firstboot.rsc manually; temporary file cleanup failed" }' '}'
+    } > "$license_path"
+    chmod 600 "$license_path"
+}
+
+stage_license_script() {
+    local image_root=$1 disk_dir license_path
+    disk_dir="$image_root/rw/disk"
+    license_path="$disk_dir/chr-license-firstboot.rsc"
+    [[ ! -L "$disk_dir" && ( ! -e "$disk_dir" || -d "$disk_dir" ) ]] || die \
+        'CHR 文件目录无效或是符号链接。' 'The CHR file directory is invalid or is a symbolic link.'
+    [[ ! -L "$license_path" && ( ! -e "$license_path" || -f "$license_path" ) ]] || die \
+        'CHR 临时授权文件路径无效或是符号链接。' 'The CHR temporary license-file path is invalid or is a symbolic link.'
+    if [[ "$LICENSE_ENABLED" == "1" ]]; then
+        mkdir -p -- "$disk_dir"
+        write_license_script "$license_path"
+        sync "$license_path"
+    elif [[ -f "$license_path" ]]; then
+        rm -f -- "$license_path"
+    fi
+    LICENSE_ACCOUNT=""
+    LICENSE_PASSWORD=""
 }
 
 write_autorun_file() {
@@ -2396,6 +2600,9 @@ write_autorun_file() {
         printf '%s\n' '/ip/service/set [find where name="api"] disabled=yes'
         printf '%s\n' '/ip/service/set [find where name="api-ssl"] disabled=yes'
         printf '%s\n' '/tool/bandwidth-server/set enabled=no'
+        if [[ "$LICENSE_ENABLED" == "1" ]]; then
+            printf '%s\n' ':do { :local task [/file/find where name="chr-license-firstboot.rsc"]; :if ([:len $task] = 0) do={ :error "License task file missing" }; :local source [/file/get $task contents]; :execute $source } on-error={ :log warning "[CHR license] Unable to start first-boot license task"; :do { /file/remove [/file/find where name="chr-license-firstboot.rsc"] } on-error={} }'
+        fi
     } > "$autorun_path"
     if awk '/^[[:space:]]*$/ || /#/ {bad=1} END {exit bad ? 0 : 1}' "$autorun_path"; then
         die \
@@ -2442,6 +2649,7 @@ customize_image() {
     if [[ -n "$CONTAINER_PACKAGE_PATH" ]]; then
         install_container_package "$MOUNT_DIR"
     fi
+    stage_license_script "$MOUNT_DIR"
     write_autorun_file "$autorun_path"
     write_rosmode_file "$rosmode_path"
     if [[ -n "$CONTAINER_PACKAGE_PATH" ]]; then
@@ -2480,6 +2688,11 @@ customize_image() {
             'On first boot, CHR will use the specified static IPv4 address, gateway, and DNS.'
     fi
     printf '%s %s\n' "$(i18n 'RouterOS 时区：' 'RouterOS time zone:')" "$ROUTEROS_TIME_ZONE"
+    if [[ "$LICENSE_ENABLED" == "1" ]]; then
+        printf '%s %s\n' "$(i18n '首启试用申请（尚未授权）：' 'First-boot trial request (not yet activated):')" "$LICENSE_LEVEL"
+        say '首启后台等待网络最多 180 秒，授权最多尝试 3 次；请登录后检查 /system/license/print 和 CHR license 日志。' \
+            'The background task waits up to 180 seconds for networking, then tries licensing up to 3 times; check /system/license/print and CHR license logs after login.'
+    fi
     say '已保留 SSH 和 WinBox，关闭 Telnet、FTP、HTTP、API。' \
         'SSH and WinBox remain enabled, while Telnet, FTP, HTTP, and API are disabled.'
     say '已关闭所有接口上的 IP Neighbor 发送与接收，不发现其它设备，也不被其它设备发现。' \
@@ -2638,6 +2851,7 @@ main() {
     fi
     choose_network_config
     choose_admin_password
+    choose_license_config
     customize_image
     confirm_storage
     write_and_reboot
